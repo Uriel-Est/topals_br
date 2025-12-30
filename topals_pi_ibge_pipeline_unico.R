@@ -40,7 +40,7 @@ suppressPackageStartupMessages({
 
 BASE_DIR <- "C:/Users/uriel/Documents/UFPB Estatística/Demografia 1/Estudos Demográficos - PB/TOPALS"
 
-UF_ALVO   <- "PE"                  # UF que você quer rodar
+UF_ALVO   <- "RS"                  # UF que você quer rodar
 ANOS_FIT  <- 2000:2023             # anos para rodar o TOPALS
 NIVEIS_FIT <- "municipio"          # por enquanto só município
 ANOS_DIAG <- c(2000L, 2005L, 2010L, 2015L, 2020L, 2023L) # anos para diagnósticos/log(mx) etc.
@@ -867,7 +867,7 @@ message("Resumo dos fits salvo em (PARQUET): ", res_pb_parquet_path)
 message("\n===== [02] Extraindo e0/pi dos fits TOPALS+pi+IBGE =====")
 
 res_pb_parquet_path <- file.path(
-  TOPALS_FIT_DIR,
+  RES_DB_DIR,
   sprintf("resumo_fits_%s_municipio_imediata_pi_ibge.parquet", UF_ALVO)
 )
 
