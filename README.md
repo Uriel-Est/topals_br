@@ -319,6 +319,6 @@ Para questões ou problemas:
 
 **Nota**: Este README descreve a versão do pipeline que inclui separação por sexo e ajuste pós-estimação (shrink). Para a versão sem sexo ou sem ajuste, consulte branches anteriores do repositório.
 
-**Última atualização**: Novembro 2024  
+**Última atualização**: Janeiro 2026  
 **Versão do Pipeline**: 2.0 (com sexo e shrink)  
 **Compatibilidade**: R ≥ 4.1.0, dados SIM/Demografia 2000-2023
