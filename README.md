@@ -1,297 +1,324 @@
-# Pipeline TOPALS – Esperança de vida municipal
+# Projeto TOPALS - Mortalidade Municipal no Brasil
 
-Este repositório implementa um pipeline completo para estimar e analisar a esperança de vida ao nascer (e₀) em nível municipal no Brasil usando TOPALS + *shrinkage* para a UF e indicadores derivados.
+## 📊 Visão Geral
 
-A lógica geral é:
+Este projeto implementa uma metodologia estatística avançada para estimar a mortalidade municipal no Brasil, utilizando o método **TOPALS (TOP** **A**djustment of **L**og-**S**chedules) com âncora nas tábuas oficiais do IBGE. O sistema produz estimativas de:
 
-1. **00B – preparação das bases (`bases_topals_preparadas.RData`)**
-2. **`pipeline_unico_*` – estimação TOPALS + e₀ municipal (00B + 01 + 02 + 03 + 05B)**
-3. **`06_analises_avancadas_e0.R` – indicadores avançados de mortalidade e longevidade**
+- **Esperança de vida ao nascer (e0)** para municípios brasileiros (2000-2023)
+- **Taxas específicas de mortalidade (mx)** por idade simples (0-100 anos)
+- **Indicadores derivados**: e60, APVP, desigualdade na longevidade, decomposição de mudanças
+- **Mapas nacionais e estaduais** da esperança de vida
 
-Tudo é parametrizado principalmente por:
+O pipeline é **sensível ao sexo** (masculino, feminino, ambos) e inclui ajustes pós-estimação (shrink) para alinhar as estimativas municipais às referências estaduais.
 
-- `UF_ALVO` – sigla da unidade da federação (`"PB"`, `"SP"`, …)  
-- `SEXO_ALVO` – sexo de interesse (`"b"` para ambos; outros códigos conforme base)
+## 🛠️ Pré-requisitos
 
----
+### Software Requerido
+- **R** (versão ≥ 4.1.0 recomendada)
+- **RStudio** (opcional, mas recomendado para desenvolvimento)
+- **Git** (para controle de versão)
 
-## Estrutura mínima de pastas
-
-Sugerido (pode adaptar, desde que ajuste `BASE_DIR` nos scripts):
-
-```
-.
-├── R/
-│   ├── 00B.R
-│   ├── topals_pi_ibge_pipeline_unico.R
-│   └── topals_indicadores_avancados.R
-└── data/
-    ├── raw/              # microdados SIM, populações, etc.
-    ├── 00_mx_reconstrucao/
-    │   └── bases_topals_preparadas.RData
-    ├── 05B_mx_post_e0_<UF>/
-    │   ├── tabelas/
-    │   └── figuras/
-    └── 06_analises_avancadas/
-        └── <UF>/
-            ├── tabelas/
-            └── figuras/
-```
-
-Nos scripts eu uso um `BASE_DIR` que aponta para a pasta do projeto. A partir dele, cada etapa cria suas próprias subpastas.
-
----
-
-## Dependências de software
-
-* R (>= 4.x)
-* Pacotes principais:
-
-  * `dplyr`, `tidyr`, `purrr`, `readr`, `tibble`, `stringr`, `ggplot2`
-  * `sf`, `geobr`, `viridis`
-* Pacotes opcionais (blocos correspondentes são pulados se não estiverem instalados):
-
-  * `spdep` – suavização espacial e LISA
-  * `DemoDecomp` – decomposição de Horiuchi
-  * `plotly` + `htmlwidgets` – superfície 3D interativa de log(mx)
-
-Instalação rápida:
+### Pacotes R Principais
+O sistema utiliza os seguintes pacotes (instalação automática pode ser configurada):
 
 ```r
-pkgs <- c(
-  "dplyr", "tidyr", "purrr", "readr", "tibble", "stringr",
-  "ggplot2", "sf", "geobr", "viridis",
-  "spdep", "DemoDecomp", "plotly", "htmlwidgets"
-)
-install.packages(setdiff(pkgs, rownames(installed.packages())))
+# Pacotes essenciais
+install.packages(c(
+  "dplyr", "tidyr", "purrr", "stringr", "readr", "tibble",
+  "ggplot2", "sf", "geobr", "viridis", "grid",
+  "arrow", "janitor", "readxl", "splines", "rstan"
+))
+
+# Para decomposição demográfica (opcional)
+install.packages("DemoDecomp")
+
+# Para análises espaciais (opcional)
+install.packages("spdep")
 ```
+
+### Dependências Específicas
+- **rstan**: Requer compilador C++ compatível (RTools no Windows)
+- **geobr**: Faz download automático de shapes do IBGE
+- **arrow**: Para leitura/escrita eficiente de dados em Parquet
+
+## 📁 Estrutura de Pastas
+
+```
+TOPALS/
+├── 00_prep_topals.R                         # Script de preparação dos dados
+├── 00_prep_topals_OTIMIZADO.R               # Versão otimizada (opcional)
+├── 00b_build_tabua_ibge_uf.R                # Constrói tábuas IBGE (contido no pipeline)
+├── pipeline_topals_pi_ibge_unico.R          # Pipeline principal (00b+01+02+03+05B)
+├── 06_analises_avancadas_e0.R               # Análises avançadas
+├── 07_mapa_e0_brasil.R                      # Mapas nacionais
+├── 00_prep_topals_output/                   # Saídas do passo 00
+│   └── bases_topals_preparadas.RData        # Dados preparados
+├── projecoes_2024_tab5_tabuas_mortalidade.xlsx  # Tábuas IBGE (fonte externa)
+├── resultados/                              # Todos os resultados
+│   ├── BRASIL/                              # Agregado nacional
+│   │   ├── bancos_de_dados/
+│   │   └── figuras/
+│   └── [UF]/                                # Por estado (ex.: PB, SP, MG)
+│       └── sexo_[b|m|f]/                    # Por sexo (ambos, masculino, feminino)
+│           ├── figuras/
+│           ├── bancos_de_dados/
+│           └── indicadores_avancados/
+└── dados/                                   # Dados brutos (estrutura sugerida)
+    ├── pops_municipio_idade_sexo.parquet    # População (input)
+    └── obitos_municipio_idade_sexo.parquet  # Óbitos (input)
+```
+
+## 📥 Dados de Entrada
+
+### 1. Dados Demográficos
+Dois arquivos principais (formato Parquet recomendado):
+
+**População:**
+- Colunas requeridas: `ano`, `code_muni6` (ou similar), `idade`, `sexo`, `pop`
+- Idades: 0-100 anos (preferencialmente idade simples)
+- Sexo: "m"/"f" ou "1"/"2" (será normalizado para "m"/"f"/"b")
+
+**Óbitos:**
+- Colunas requeridas: `ano`, `code_muni6`, `idade`, `sexo`, `obitos`
+- Opcional: `cobertura_sim` (cobertura do SIM)
+
+### 2. Tábuas de Mortalidade IBGE
+- Arquivo: `projecoes_2024_tab5_tabuas_mortalidade.xlsx`
+- Fonte: IBGE (projeções 2024)
+- Contém: Tábuas completas de mortalidade por UF, sexo e ano (2000-2070)
+
+### 3. Formato dos Códigos Municipais
+- **6 dígitos** (ex: 250750 = João Pessoa/PB)
+- O sistema aceita 6 ou 7 dígitos (com dígito verificador)
+
+## 🔄 Fluxo de Trabalho
+
+### Passo 1: Preparação dos Dados
+```r
+# Ajuste os caminhos no script
+source("00_prep_topals.R")
+```
+**O que faz:**
+- Lê dados de população e óbitos
+- Normaliza sexo (m/f/b)
+- Adiciona informações geográficas (UF, região, RGI)
+- Salva `bases_topals_preparadas.RData`
+
+**Saída:**
+- `00_prep_topals_output/bases_topals_preparadas.RData`
+
+### Passo 2: Pipeline Principal (Estado + Sexo)
+```r
+# Configure no início do script:
+# UF_ALVO <- "PB"  # Estado desejado
+# SEXO_ALVO <- "b" # "b" (ambos), "m" (masculino), "f" (feminino)
+
+source("pipeline_topals_pi_ibge_unico.R")
+```
+
+**Etapas internas:**
+1. **00b**: Constrói tábuas IBGE com sexo
+2. **01**: Ajusta modelos TOPALS+pi+IBGE para cada ano
+3. **02**: Extrai e0 e pi (cobertura) das estimativas
+4. **03**: Prepara função de reconstrução de mx
+5. **05B**: Shrink ex-post + NMX final + mapas e tabelas
+
+**Saídas (por UF/sexo):**
+- `resultados/[UF]/sexo_[b|m|f]/bancos_de_dados/`
+  - `nmx_final_municipios_idade_simples.parquet`
+  - `tabela_vida_municipios_idade_simples.parquet`
+  - `e0_municipios_post_shrink.parquet`
+- `resultados/[UF]/sexo_[b|m|f]/figuras/`
+  - Mapas de e0 e e60
+  - Séries temporais para municípios foco
+  - Curvas de log(mx)
+
+### Passo 3: Análises Avançadas (Opcional)
+```r
+# Configure UF_ALVO e SEXO_ALVO
+source("06_analises_avancadas_e0.R")
+```
+
+**Análises geradas:**
+- Mapas de ganho absoluto em e0 (2000-2023)
+- Decomposição de ∆e0 por idade (método Horiuchi)
+- APVP (Anos Potenciais de Vida Perdidos)
+- Gini da morte (desigualdade na longevidade)
+- Clusters LISA de mortalidade
+- Curvas de sobrevivência comparativas
+
+### Passo 4: Mapas Nacionais
+```r
+source("07_mapa_e0_brasil.R")
+```
+
+**Requisito:** Ter executado o pipeline para **todas as UFs** (pelo menos para sexo="b")
+
+**Saídas em `resultados/BRASIL/`:**
+- Mapas municipais de e0 (2000 e 2023) - versões bruta e ajustada
+- Mapa 2x2 comparativo (2000/2023 × bruto/ajustado)
+- Curvas nacionais de log(mx) e e0 mediana
+
+## 📊 Saídas Principais
+
+### 1. Indicadores Municipais
+- `e0_p50_post`: Esperança de vida ao nascer (pós-shrink)
+- `e0_raw`: e0 bruta (sem ajuste)
+- `e60_post`: Esperança de vida aos 60 anos
+- `mx_nmx_final`: Taxas específicas de mortalidade suavizadas
+
+### 2. Tabelas de Vida Completas
+Por município, ano e sexo:
+- `lx`, `dx`, `qx`, `Lx`, `Tx`, `ex`
+
+### 3. Figuras e Mapas
+- **Mapas estaduais**: e0, e60, APVP, déficit vs UF
+- **Séries temporais**: e0 municipal vs estadual
+- **Curvas de mortalidade**: log(mx) por idade
+- **Mapas nacionais**: e0 municipal para 2000 e 2023
+
+### 4. Estatísticas Avançadas
+- Decomposição da mudança em e0 por idade
+- Anos Potenciais de Vida Perdidos (APVP)
+- Índice de Gini da idade ao óbito
+- Clusters espaciais (LISA) de mortalidade
+
+## ⚙️ Configurações Importantes
+
+### No Pipeline Principal:
+```r
+# Configure no início do script pipeline_topals_pi_ibge_unico.R
+BASE_DIR <- "C:/seu/caminho/para/TOPALS"  # Ajuste obrigatório
+UF_ALVO <- "PB"      # Estado a ser processado
+SEXO_ALVO <- "b"     # "b", "m" ou "f"
+ANOS_FIT <- 2000:2023 # Anos para estimação
+NIVEIS_FIT <- "municipio" # Nível geográfico
+```
+
+### Na Preparação de Dados:
+```r
+# Em 00_prep_topals.R, ajuste:
+POP_INPUT <- "caminho/para/populacao.parquet"
+OBITOS_INPUT <- "caminho/para/obitos.parquet"
+UF_FILTER <- NULL  # NULL para todas UFs, ou c("PB", "PE") para filtrar
+```
+
+## 🚀 Execução em Lote
+
+Para processar múltiplos estados/sexos:
+
+```r
+# Exemplo: processar PB, PE e CE para ambos os sexos
+estados <- c("PB", "PE", "CE")
+sexos <- c("b", "m", "f")
+
+for(uf in estados) {
+  for(sexo in sexos) {
+    # 1. Configurar UF_ALVO e SEXO_ALVO no script
+    # 2. Executar pipeline_topals_pi_ibge_unico.R
+    # 3. Executar 06_analises_avancadas_e0.R (opcional)
+  }
+}
+
+# Após todos estados, executar 07_mapa_e0_brasil.R
+```
+
+## 🐛 Solução de Problemas
+
+### Problema: Erro na compilação do Stan
+**Solução:** Verifique instalação do RTools (Windows) ou compilador C++. Tente:
+```r
+install.packages("rstan", repos = "https://cloud.r-project.org/", dependencies = TRUE)
+rstan::rstan_options(auto_write = TRUE)
+```
+
+### Problema: Dados geográficos não carregam
+**Solução:** O geobr requer internet para download. Verifique conexão ou use cache:
+```r
+options(geobr.use_cache = TRUE)
+```
+
+### Problema: Memória insuficiente
+**Solução:** Para estados grandes (SP, MG), processe por subconjuntos:
+```r
+UF_FILTER <- c("SP")  # No 00_prep_topals.R para filtrar apenas SP
+```
+
+### Problema: Arquivos de entrada não encontrados
+**Solução:** Verifique:
+1. Caminhos absolutos em `00_prep_topals.R`
+2. Existência dos arquivos Parquet
+3. Permissões de leitura
+
+## 📈 Exemplos de Uso
+
+### 1. Obter e0 municipal para João Pessoa (2023)
+```r
+library(arrow)
+e0_pb <- read_parquet("resultados/PB/sexo_b/bancos_de_dados/e0_municipios_post_shrink.parquet")
+joao_pessoa <- e0_pb %>% 
+  filter(code_muni6 == 250750, ano == 2023) %>%
+  select(e0_p50_post, e0_ibge)
+```
+
+### 2. Criar mapa personalizado de e0
+```r
+library(sf)
+library(ggplot2)
+
+dados <- read_parquet("resultados/PB/sexo_b/bancos_de_dados/e0_municipios_post_shrink.parquet")
+mapa_pb <- geobr::read_municipality(code_muni = "PB", year = 2020)
+
+mapa_pb <- mapa_pb %>%
+  mutate(code_muni6 = as.integer(substr(code_muni, 1, 6))) %>%
+  left_join(dados %>% filter(ano == 2023), by = "code_muni6")
+
+ggplot(mapa_pb) +
+  geom_sf(aes(fill = e0_p50_post), color = NA) +
+  scale_fill_viridis_c(option = "magma") +
+  theme_void()
+```
+
+## 📚 Referências Métodológicas
+
+1. **TOPALS**: 
+   - De Beer, J., & van der Gaag, N. (2015). TOPALS: A tool for projecting age-specific rates using linear splines.
+   - Schmertmann, C., & Gonzaga, M. (2018). Bayesian estimation of age-specific mortality and life expectancy for small areas.
+
+2. **Âncora IBGE**:
+   - IBGE. (2024). Tábuas Completas de Mortalidade - Projeções 2024.
+
+3. **Shrinkage Bayesiano**:
+   - Gelman, A., et al. (2013). Bayesian Data Analysis.
+
+4. **Decomposição Demográfica**:
+   - Horiuchi, S., et al. (2008). Decomposing change in life expectancy.
+
+## 🤝 Contribuições
+
+Contribuições são bem-vindas! Por favor:
+
+1. Fork o repositório
+2. Crie uma branch para sua feature (`git checkout -b feature/nova-analise`)
+3. Commit suas mudanças (`git commit -am 'Adiciona nova análise'`)
+4. Push para a branch (`git push origin feature/nova-analise`)
+5. Abra um Pull Request
+
+## 📄 Licença
+
+Este projeto está licenciado sob a Licença MIT - veja o arquivo LICENSE para detalhes.
+
+## 🙋‍♂️ Suporte
+
+Para questões ou problemas:
+1. Verifique a seção de Solução de Problemas acima
+2. Abra uma issue no GitHub
+3. Contate: [ubh@academico.ufpb.br]
 
 ---
 
-## Etapa 0 – 00B: preparação das bases (`00B_prep_topals.R`)
-
-**Objetivo:** construir as bases padronizadas de mortalidade e população por município, ano, idade (e sexo) a partir dos microdados brutos.
-
-**Entradas típicas (em `data/raw/`, nomes podem variar):**
-
-* Óbitos – SIM / outra fonte de mortalidade por município, ano, idade e sexo
-* Populações / exposições – POPSVS / projeções / IBGE
-* Tabelas auxiliares:
-
-  * códigos de municípios (`code_muni6` / `code_muni`)
-  * pesos para 80+ (se usados no ajuste da cauda)
-
-**Saídas principais:**
-
-* Arquivo RData com o conjunto de bases preparadas:
-
-  ```
-  data/00_mx_reconstrucao/bases_topals_preparadas.RData
-  ```
-
-  contendo, pelo menos:
-
-  * `base_muni` – mortes e população por `uf_sigla`, `code_muni6`, `ano`, `idade`, `sexo` (ou `pop_ambos`)
-  * (outros objetos auxiliares usados pelo pipeline)
-
-**Como rodar:**
-
-```r
-# dentro de R/
-source("R/00B_prep_topals.R")
-```
-
-Essa etapa precisa ser executada **uma vez** (ou sempre que a base bruta for atualizada).
-
----
-
-## Etapa 1 – pipeline único TOPALS (`pipeline_unico_topals.R`)
-
-**Objetivo:** executar toda a sequência de estimação TOPALS + *shrinkage* para uma UF específica, produzindo séries de `mx` pós-ajuste e `e₀` municipal.
-
-O script incorpora as etapas originais:
-
-* 00B – leitura de `bases_topals_preparadas.RData`
-* 01 – construção das tábuas “alvo” (IBGE / referência)
-* 02 – ajuste TOPALS por município
-* 03 – *shrinkage* / suavização para a UF
-* 05B – cálculo de `e0` e geração de saídas
-
-**Parâmetros principais dentro do script:**
-
-```r
-BASE_DIR  <- "path/para/o/projeto"
-UF_ALVO   <- "PB"   # mudar para "SP", "MG", ...
-SEXO_ALVO <- "b"    # ambos, ou conforme nomenclatura usada
-ANOS_ANALISE <- 2000:2023
-```
-
-**Entradas obrigatórias:**
-
-* `data/00_mx_reconstrucao/bases_topals_preparadas.RData`
-* (opcional) tábuas de vida IBGE / referência, caso venham de arquivo externo
-
-**Saídas principais (por UF):**
-
-Cria a pasta:
-
-```
-data/05B_mx_post_e0_<UF>/
-├── tabelas/
-│   ├── e0_municipios_post_shrink.csv
-│   ├── mx_post_municipios_*.csv      # formatos específicos do pipeline
-│   └── ...
-└── figuras/
-    ├── mapas_e0_*.png
-    ├── curvas_topals_*.png
-    └── ...
-```
-
-O arquivo-chave para as análises avançadas é:
-
-* `e0_municipios_post_shrink.csv`
-
-com colunas como:
-
-* `uf`, `code_muni6`, `nome_muni`, `ano`, `sexo`, `nivel`
-* `e0_p50_post` – esperança de vida pós-*shrinkage* (mediana posterior)
-* `e0_ibge` – referência de e₀ da UF
-* outros parâmetros do modelo.
-
-**Como rodar:**
-
-```r
-# dentro de R/
-source("R/pipeline_unico_topals.R")
-```
-
-Repetir mudando `UF_ALVO` para gerar resultados de outros estados.
-
----
-
-## Etapa 2 – indicadores avançados de e₀ (`06_analises_avancadas_e0.R`)
-
-**Objetivo:** a partir das saídas da etapa 1 (e das bases de mx da etapa 0), produzir um conjunto de indicadores e visualizações “de produto final”.
-
-**Entradas obrigatórias:**
-
-* `data/05B_mx_post_e0_<UF>/tabelas/e0_municipios_post_shrink.csv`
-* `data/00_mx_reconstrucao/bases_topals_preparadas.RData`
-
-**Parâmetros principais no topo do script:**
-
-```r
-BASE_DIR   <- "path/para/o/projeto"
-UF_ALVO    <- "PB"
-SEXO_ALVO  <- "b"
-
-ANOS_ANALISE <- 2000:2023
-ANO_INI_GAIN <- 2000L
-ANO_FIM_GAIN <- 2023L
-```
-
-**Saídas:**
-
-Cria uma pasta por UF em:
-
-```
-data/06_analises_avancadas/<UF>/
-├── tabelas/
-│   ├── munis_foco_<UF>_<sexo>.csv
-│   ├── decomp_e0_horiuchi_*.csv
-│   ├── gini_morte_e0_<UF>.csv
-│   ├── avp_municipios_vs_uf_<UF>.csv
-│   ├── deficit_superavit_e0_vs_uf_<UF>.csv
-│   └── ...
-└── figuras/
-    ├── mapa_ganho_abs_e0_<UF>_2000_2023.png
-    ├── mapa_e0_suavizado_<UF>_2023.png
-    ├── mapa_lisa_e0_post_<UF>_2023.png
-    ├── tendencia_logmx_por_faixa_UF_<UF>_<sexo>.png
-    ├── tendencia_logmx_por_faixa_muni_<UF>_<sexo>_<code>.png
-    ├── curvas_logmx_por_idade_muni_<UF>_<sexo>_<code>.png
-    ├── decomp_e0_horiuchi_UF_<UF>_2000_2023.png
-    ├── decomp_e0_horiuchi_muni_<UF>_<sexo>_<code>_2000_2023.png
-    ├── curvas_lx_l0_UF_<UF>.png
-    ├── curvas_lx_l0_muni_vs_uf_<UF>_<sexo>_<code>_2000_2023.png
-    ├── serie_e0_gini_morte_<UF>.png
-    ├── piramide_mortalidade_dx_<UF>.png
-    ├── superficie_logmx_<UF>.png
-    ├── superficie_logmx_<UF>_3D.html
-    ├── mapa_avp_vs_uf_<UF>_2023.png
-    └── mapa_deficit_e0_vs_uf_<UF>_2023.png
-```
-
-### 2.1. Seleção dos municípios foco (`munis_foco`)
-
-O script constrói automaticamente um conjunto de municípios de interesse (`munis_foco`) que serão usados em todos os gráficos **não espaciais**:
-
-* séries de log(mx) por faixa etária,
-* curvas de log(mx) por idade,
-* decomposições de e₀,
-* curvas de sobrevivência lx/l₀ comparando UF × município etc.
-
-Por padrão, a seleção combina:
-
-1. **Extremos de nível de e₀**
-
-   * e₀ **baixa / alta** no início do período (`ANO_INI_GAIN`)
-   * e₀ **baixa / alta** no final do período (`ANO_FIM_GAIN`)
-
-2. **Extremos de ganho em e₀**
-
-   * municípios com **baixo ganho** absoluto em e₀
-   * municípios com **alto ganho** absoluto em e₀
-
-A seleção é feita via quantis (10% inferior / 10% superior) e, para cada subconjunto, são escolhidos até `n_top_por_tipo` municípios (default = 3). Um mesmo município pode aparecer em mais de um tipo, e os tipos são concatenados na coluna `tipo`.
-
-O resultado é salvo em:
-
-```
-tabelas/munis_foco_<UF>_<sexo>.csv
-```
-
-#### Seleção manual / por LISA
-
-O script também permite (ver cabeçalho do arquivo):
-
-* **adicionar uma lista manual** de `code_muni6` a serem forçados em `munis_foco`;
-* **importar clusters LISA** (High-High, Low-Low etc.) calculados no próprio script e usar apenas municípios de certos tipos de cluster.
-
-A ideia é que você possa alternar entre:
-
-* seleção **automática via quantis**;
-* seleção **guiada por clusters LISA**;
-* seleção **totalmente manual** (lista de municípios / RGIs).
-
-Os parâmetros de controle estão definidos no topo de `06_analises_avancadas_e0.R` e são comentados dentro do próprio script.
-
----
-
-## Fluxo de execução resumido
-
-Uma sequência típica para um novo estado:
-
-```r
-# 0) Preparar bases (uma vez para o BR ou sempre que atualizar dados)
-source("R/00B_prep_topals.R")
-
-# 1) Rodar pipeline TOPALS para a UF desejada
-UF_ALVO <- "PB"
-source("R/pipeline_unico_topals.R")
-
-# 2) Gerar indicadores avançados para a mesma UF / sexo
-UF_ALVO   <- "PB"
-SEXO_ALVO <- "b"
-source("R/06_analises_avancadas_e0.R")
-```
-
-Para outro estado, basta alterar `UF_ALVO` (e eventualmente `SEXO_ALVO`) e repetir as etapas 1 e 2.
-
----
-
-## Notas finais
-
-* Vários blocos do script 06 são opcionais e protegidos por `if (has_spdep)`, `if (has_DemoDecomp)` e `if (has_plotly)`. Se você não tiver esses pacotes instalados, os mapas LISA, a decomposição de Horiuchi e a superfície 3D simplesmente serão pulados.
-* Os scripts foram escritos pensando em **reprodutibilidade estadual**: sempre que possível, tudo é parametrizado por `UF_ALVO` e `SEXO_ALVO`, de forma que o mesmo código funcione para qualquer estado do Brasil, desde que as bases de entrada sigam o padrão esperado.
-* Em caso de dúvida sobre o formato das bases de entrada, confira diretamente o script `00B_prep_topals.R`, onde a estrutura de `base_muni` e demais objetos é construída.
+**Nota**: Este README descreve a versão do pipeline que inclui separação por sexo e ajuste pós-estimação (shrink). Para a versão sem sexo ou sem ajuste, consulte branches anteriores do repositório.
+
+**Última atualização**: Novembro 2024  
+**Versão do Pipeline**: 2.0 (com sexo e shrink)  
+**Compatibilidade**: R ≥ 4.1.0, dados SIM/Demografia 2000-2023
