@@ -46,8 +46,8 @@ suppressPackageStartupMessages({
 
 BASE_DIR <- "C:/Users/uriel/Documents/UFPB Estatística/Demografia 1/Estudos Demográficos - PB/TOPALS"
 
-UF_ALVO    <- "SC"          # UF que você quer rodar
-SEXO_ALVO  <- "f"           # "b" (ambos), "m" (masc), "f" (fem)
+UF_ALVO    <- "SP"          # UF que você quer rodar
+SEXO_ALVO  <- "m"           # "b" (ambos), "m" (masc), "f" (fem)
 ANOS_FIT   <- 2000:2023
 NIVEIS_FIT <- "municipio"
 ANOS_DIAG  <- c(2000L, 2005L, 2010L, 2015L, 2020L, 2023L)
@@ -673,7 +673,10 @@ fit_one_case <- function(this_ano,
     )
   )
   
-  save(fit, stanDataList, case_meta, file = fitfile)
+  tmpfile <- paste0(fitfile, ".tmp")
+  save(fit, stanDataList, case_meta, file = tmpfile)
+  ok <- file.rename(tmpfile, fitfile)
+  if (!ok) stop("Falhou renomear tmp -> fitfile (possível lock/sync/antivírus): ", fitfile)
   
   tibble::tibble(
     ano       = this_ano,
@@ -800,7 +803,6 @@ for (i in seq_len(nrow(cases))) {
   if (is.null(res_i)) next
   results_new <- dplyr::bind_rows(results_new, res_i)
   
-  results_new <- dplyr::bind_rows(results_new, res_i)
 }
 
 # Salva resumo final em RESULTS (bancos_de_dados)
