@@ -1,5 +1,5 @@
 ###############################################################################
-# TOPALS + pi + IBGE – PIPELINE ÚNICO (00b + 01 + 02 + 03 + 05B) — COM SEXO
+# gold_topals.R
 #
 # ✅ Metodologia e aplicação: IGUAL ao seu pipeline atual.
 # 🆕 ÚNICA novidade: roda para qualquer sexo ("b","m","f"), lendo:
@@ -46,11 +46,11 @@ suppressPackageStartupMessages({
 
 BASE_DIR <- "C:/Users/uriel/Documents/UFPB Estatística/Demografia 1/Estudos Demográficos - PB/TOPALS"
 
-UF_ALVO    <- "SP"          # UF que você quer rodar
-SEXO_ALVO  <- "m"           # "b" (ambos), "m" (masc), "f" (fem)
-ANOS_FIT   <- 2000:2023
-NIVEIS_FIT <- "municipio"
-ANOS_DIAG  <- c(2000L, 2005L, 2010L, 2015L, 2020L, 2023L)
+UF_ALVO    <- "RR"            # ou a UF que você quiser testar
+SEXO_ALVO  <- "f"             # feminino
+ANOS_FIT   <- 2023            # só um ano
+NIVEIS_FIT <- "municipio"     # ou "imediata" se quiser testar mais rápido
+ANOS_DIAG  <- c(2023)         # para diagnósticos e mapas
 
 # Normaliza sexo do usuário (aceita "M/F/B", "masc/fem/ambos")
 norm_sexo_user <- function(x) {
@@ -306,7 +306,8 @@ make_B_matrix <- function(ages = 0:100) {
 
 # e0 a partir de log(mx)
 e0_from_logmx <- function(logmx) {
-  mx <- exp(logmx)
+  mx <- exp(pmin(logmx, 30))  # evita overflow em exp(logmx)
+  mx <- pmax(mx, 1e-12)
   px <- exp(-mx)
   lx <- c(1, cumprod(px))
   sum(head(lx, -1) + tail(lx, -1)) / 2
@@ -576,15 +577,19 @@ build_stan_data_case <- function(base_muni_df,
   
   e0_target <- e0_from_logmx(std_logmx)
   
-  cov_prior <- df %>% dplyr::distinct(cobertura_sim) %>% dplyr::pull()
-  if (length(cov_prior) == 0L || all(is.na(cov_prior))) {
-    warning("cobertura_sim ausente/NA; usando prior pi≈0.9 com logit sd 0.7.")
-    cov_prior <- 0.9
-  } else {
-    cov_prior <- mean(cov_prior, na.rm = TRUE)
-  }
-  cov_prior <- cov_prior / ifelse(cov_prior > 1.5, 100, 1)
-  cov_prior <- min(max(cov_prior, 0.01), 0.99)
+  # cov_prior <- df %>% dplyr::distinct(cobertura_sim) %>% dplyr::pull()
+  # if (length(cov_prior) == 0L || all(is.na(cov_prior))) {
+  #   warning("cobertura_sim ausente/NA; usando prior pi≈0.9 com logit sd 0.7.")
+  #   cov_prior <- 0.9
+  # } else {
+  #   cov_prior <- mean(cov_prior, na.rm = TRUE)
+  # }
+  # cov_prior <- cov_prior / ifelse(cov_prior > 1.5, 100, 1)
+  # cov_prior <- min(max(cov_prior, 0.01), 0.99)
+  # Prior neutro: espera que a cobertura seja 50% (sem viés)
+  # e usa um desvio padrão grande na escala logito (sigma=1.5)
+  pi_prior_mean <- 0.5   # ou 0.6, mas 0.5 é mais neutro
+  sigma_logit_pi <- 1.5  # já está com esse valor? mantenha ou aumente para 2.0 se quiser um prior mais frouxo
   
   stanDataList <- list(
     R = R,
@@ -595,10 +600,10 @@ build_stan_data_case <- function(base_muni_df,
     std_schedule    = std_logmx,
     N               = pmax(N_mat, 0.01),
     D               = D_mat,
-    pi_prior_mean   = rep(cov_prior, R),
-    sigma_logit_pi  = 0.7,
+    pi_prior_mean   = rep(0.5, R),   # <- novo prior
+    sigma_logit_pi  = 1.5,           # ou 2.0
     e0_target       = e0_target,
-    sigma_e0_target = 1.0
+    sigma_e0_target = 1.0            # já está 1.0, mantenha
   )
   
   list(stanData = stanDataList, regions = regions, ages = ages)
@@ -977,6 +982,48 @@ message(" - ", e0_pi_imed_path)
 
 message("\n===== [03] Definindo reconstruct_mx_muni | sexo=", SEXO_ALVO, " =====")
 
+# HOTFIX p/ [03]: garantir resumo_fits em RDS (ou ler do parquet do FIT_DIR)
+
+# caminhos do resumo
+res_pb_parquet_fitdir <- file.path(
+  TOPALS_FIT_DIR,
+  sprintf("resumo_fits_%s_sex%s_municipio_imediata_pi_ibge.parquet", UF_ALVO, SEXO_ALVO)
+)
+
+res_pb_rds_path <- file.path(
+  RES_DB_DIR,
+  sprintf("resumo_fits_%s_sex%s_municipio_imediata_pi_ibge.rds", UF_ALVO, SEXO_ALVO)
+)
+
+# 1) carrega o resumo do parquet (fonte da verdade)
+if (!file.exists(res_pb_parquet_fitdir)) {
+  stop("Não achei o resumo parquet no FIT_DIR: ", res_pb_parquet_fitdir,
+       "\n(rode o bootstrap do resumo ou confira TOPALS_FIT_DIR)")
+}
+
+res_pb <- arrow::read_parquet(res_pb_parquet_fitdir) %>%
+  dplyr::mutate(
+    ano    = as.integer(ano),
+    nivel  = as.character(nivel),
+    sexo   = as.character(sexo),
+    uf     = as.character(uf),
+    fitfile = as.character(fitfile)
+  ) %>%
+  dplyr::filter(uf == UF_ALVO, sexo == SEXO_ALVO, nivel == "municipio") %>%   # <<< só município
+  dplyr::arrange(ano)
+
+# 2) se o RDS não existe no RESULTS, cria agora
+if (!file.exists(res_pb_rds_path)) {
+  saveRDS(res_pb, res_pb_rds_path)
+  message("✅ Criei o resumo RDS no RESULTS: ", res_pb_rds_path)
+} else {
+  message("✅ Resumo RDS já existe: ", res_pb_rds_path)
+}
+
+# sanity
+message("Resumo p/ [03]: n=", nrow(res_pb),
+        " | anos=", min(res_pb$ano, na.rm=TRUE), "–", max(res_pb$ano, na.rm=TRUE))
+
 # Reusa res_pb (resumo) para localizar fit por ano
 res_pb_rds_path <- file.path(RES_DB_DIR, sprintf("resumo_fits_%s_sex%s_municipio_imediata_pi_ibge.rds", UF_ALVO, SEXO_ALVO))
 if (!file.exists(res_pb_rds_path)) stop("Não achei resumo fits RDS: ", res_pb_rds_path)
@@ -1104,21 +1151,14 @@ calc_e0_from_mx_tbl <- function(mx_tbl, mx_col = "mx_topals") {
   ex[1]
 }
 
-delta_stats <- e0_muni_base %>%
-  dplyr::group_by(ano) %>%
-  dplyr::summarise(delta_med = median(delta_e0, na.rm = TRUE), .groups = "drop") %>%
-  dplyr::mutate(
-    escala_ano = dplyr::case_when(
-      abs(delta_med) <= 1 ~ 1,
-      TRUE ~ pmax(0.25, 1 / abs(delta_med))
-    )
-  )
+# ============================================================
+# [05B] W (shrink) — versão "local e defensável"
+# - SEM acoplamento global por ano (delta_stats)
+# - W depende só do delta (e0_topals - e0_ibge) no próprio muni-ano
+# - opcional: suavização por ano (DESLIGADA por padrão)
+# ============================================================
 
-get_escala_ano <- function(ano) {
-  linha <- delta_stats[delta_stats$ano == ano, ]
-  if (nrow(linha) == 0) return(1)
-  linha$escala_ano[[1]]
-}
+USE_YEAR_SHRINK <- FALSE
 
 year_shrink_factor <- function(ano) {
   dplyr::case_when(
@@ -1131,23 +1171,23 @@ year_shrink_factor <- function(ano) {
   )
 }
 
-compute_w <- function(e0_topals, e0_ibge, ano, delta_hi = 5, delta_cap = 10) {
-  if (is.na(e0_topals) || is.na(e0_ibge)) return(0)
+# w cresce suavemente de 0 a w_max quando delta vai de delta0 a delta1
+compute_w_local <- function(e0_topals, e0_ibge, ano,
+                            delta0 = 2.0, delta1 = 8.0, w_max = 0.9) {
+  if (!is.finite(e0_topals) || !is.finite(e0_ibge)) return(0)
   delta <- e0_topals - e0_ibge
-  if (delta <= 0) return(0)
+  if (delta <= delta0) return(0)
   
-  esc_ano <- get_escala_ano(ano)
-  base_w  <- 1 - esc_ano
+  z <- (delta - delta0) / (delta1 - delta0)
+  z <- pmin(pmax(z, 0), 1)
   
-  extra <- 0
-  if (delta > delta_hi) {
-    extra <- (delta - delta_hi) / (delta_cap - delta_hi)
-    extra <- pmin(pmax(extra, 0), 1)
-    extra <- 0.3 * extra
-  }
+  # easing (suave, sem degrau)
+  w <- z*z*(3 - 2*z)
   
-  w <- (base_w + extra) * year_shrink_factor(ano)
-  pmin(pmax(w, 0), 0.95)
+  if (USE_YEAR_SHRINK) w <- w * year_shrink_factor(ano)
+  w <- w * w_max
+  
+  pmin(pmax(w, 0), w_max)
 }
 
 get_mx_tbl_from_reconstruct <- function(ano, code_muni6) {
@@ -1175,28 +1215,54 @@ build_life_table_from_mx_tbl <- function(mx_tbl, mx_col = "mx_nmx_final") {
   idade <- df$idade
   mx    <- df[[mx_col]]
   
-  n <- c(diff(idade), 1L)
+  # Proteção contra valores inválidos
+  mx <- pmax(as.numeric(mx), 1e-12)   # evita zero ou negativo
+  mx[is.infinite(mx) | is.na(mx)] <- 1e-12
+  
+  n <- c(diff(idade), 1L)             # largura dos intervalos (último = 1)
   ax <- rep(0.5, length(mx))
-  if (length(ax) > 0) ax[1] <- 0.3
+  if (length(ax) > 0) ax[1] <- 0.3    # para idade 0 (método de Coale‑Demeny)
   
+  # Cálculo de qx com limite máximo
   qx <- (n * mx) / (1 + (n - ax) * mx)
-  qx[length(qx)] <- 1
+  qx[length(qx)] <- 1.0               # última idade: morte certa
+  qx <- pmin(qx, 1 - 1e-12)           # nunca igual a 1 (evita lx = 0 abrupto)
   
-  lx <- numeric(length(mx)); lx[1] <- 100000
-  if (length(mx) > 1) for (i in seq_len(length(mx) - 1)) lx[i + 1] <- lx[i] * (1 - qx[i])
+  lx <- numeric(length(mx))
+  lx[1] <- 100000
+  for (i in seq_len(length(mx) - 1)) {
+    lx[i + 1] <- lx[i] * (1 - qx[i])
+  }
+  # Garantir que lx nunca fique negativo (devido a arredondamento)
+  lx <- pmax(lx, 0)
   
   dx <- lx * qx
+  dx[length(dx)] <- lx[length(dx)]    # último dx = lx final
   
   Lx <- numeric(length(mx))
+  # Para idades antes da última
   if (length(mx) > 1) {
-    Lx[1:(length(mx) - 1)] <- n[1:(length(mx) - 1)] * lx[2:length(mx)] + ax[1:(length(mx) - 1)] * dx[1:(length(mx) - 1)]
+    Lx[1:(length(mx)-1)] <- n[1:(length(mx)-1)] * lx[2:length(mx)] + ax[1:(length(mx)-1)] * dx[1:(length(mx)-1)]
   }
-  Lx[length(mx)] <- lx[length(mx)] / mx[length(mx)]
+  # Última idade (aberta): Lx = lx / mx
+  Lx[length(mx)] <- ifelse(mx[length(mx)] > 0, lx[length(mx)] / mx[length(mx)], 0)
+  Lx <- pmax(Lx, 0)
   
   Tx <- rev(cumsum(rev(Lx)))
   ex <- Tx / lx
+  ex[is.na(ex) | is.infinite(ex)] <- 0
   
-  tibble::tibble(idade = idade, n = n, mx = mx, qx = qx, lx = lx, dx = dx, Lx = Lx, Tx = Tx, ex = ex)
+  tibble::tibble(
+    idade = idade,
+    n = n,
+    mx = mx,
+    qx = qx,
+    lx = lx,
+    dx = dx,
+    Lx = Lx,
+    Tx = Tx,
+    ex = ex
+  )
 }
 
 # Grid (ano x muni)
@@ -1207,14 +1273,29 @@ munis_grid <- e0_muni_base %>% dplyr::distinct(ano, code_muni6) %>% dplyr::arran
 # (mantém a metodologia; só evita reload/extract repetido)
 # ------------------------------------------------------------
 
-# Indexa anos a partir do nome do arquivo
-fit_index <- tibble::tibble(fitfile = fitfiles) %>%
+# (RE)LISTA os fits AGORA (depois do 01 ter gerado tudo)
+fitfiles <- list.files(
+  TOPALS_FIT_DIR,
+  pattern = "^topals_pi_ibge_.*\\.RData$",
+  full.names = TRUE
+)
+
+# monta um índice e pega o MAIS RECENTE por ano (pra evitar arquivo velho/corrompido)
+fit_index <- tibble::tibble(fitfile = fitfiles) |>
   dplyr::mutate(
     ano   = as.integer(stringr::str_match(basename(fitfile), "_(\\d{4})_")[,2]),
-    nivel = stringr::str_match(basename(fitfile), "_(municipio|imediata|intermediaria)_")[,2]
-  ) %>%
-  dplyr::filter(!is.na(ano), nivel == "municipio") %>%
+    nivel = stringr::str_match(basename(fitfile), "_(municipio|imediata|intermediaria)_")[,2],
+    mtime = as.POSIXct(file.info(fitfile)$mtime)
+  ) |>
+  dplyr::filter(!is.na(ano), nivel == "municipio", file.exists(fitfile)) |>
+  dplyr::group_by(ano) |>
+  dplyr::slice_max(mtime, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
   dplyr::arrange(ano)
+
+# sanity check (opcional): quais anos estão faltando no diretório?
+missing_years <- setdiff(sort(unique(munis_grid$ano)), fit_index$ano)
+print(missing_years)
 
 get_fitfile_year <- function(ano_i) {
   ff <- fit_index$fitfile[fit_index$ano == ano_i][1]
@@ -1294,17 +1375,30 @@ mx_tbl_from_fit_current <- function(fit, regions, code_muni6, ages = 0:100, B = 
   )
 }
 
-# Barra de progresso (pra não parecer que travou)
+# ============================================================
+# [05B] LOOP PRINCIPAL — (cole este bloco inteiro)
+# Requer que você já tenha definido antes:
+# - get_fitfile_year(), mx_tbl_from_fit_current()
+# - calc_e0_from_mx_tbl(), compute_w_local()
+# - B_cur/std_cur/regions_cur etc serão carregados do fit
+# ============================================================
+
+# Barra de progresso
 pb <- utils::txtProgressBar(min = 0, max = nrow(munis_grid), style = 3)
 on.exit(close(pb), add = TRUE)
 
 # Cache do ano corrente
-ano_loaded   <- NA_integer_
-env_fit      <- NULL
-fit_cur      <- NULL
-regions_cur  <- NULL
-B_cur        <- NULL
-std_cur      <- NULL
+ano_loaded    <- NA_integer_
+env_fit       <- NULL
+fit_cur       <- NULL
+regions_cur   <- NULL
+B_cur         <- NULL
+std_cur       <- NULL
+e0_ibge_year  <- NA_real_
+
+# sanity do grid de idades
+AGES_LOOP <- 0:100
+A_LOOP <- length(AGES_LOOP)
 
 message("Iniciando shrink ex-post e construção do NMX final...")
 
@@ -1320,25 +1414,29 @@ for (idx in seq_len(nrow(munis_grid))) {
     dplyr::filter(ano == !!ano_i, code_muni6 == !!code_muni_i) %>%
     dplyr::slice(1)
   
+  # se não achou metadata desse muni-ano
   if (nrow(row_muni) == 0L) {
-    shrink_rows[[idx]] <- tibble(ano = ano_i, code_muni6 = code_muni_i,
-                                 e0_p50_post = NA_real_, w = 0, k_factor = 1,
-                                 shrink_applied = FALSE)
+    shrink_rows[[idx]] <- tibble::tibble(
+      ano = ano_i, code_muni6 = code_muni_i,
+      e0_p50_post  = NA_real_,
+      e0_topals_lt = NA_real_,
+      e0_ibge_lt   = NA_real_,
+      e0_target_lt = NA_real_,
+      w = 0, k_factor = 1,
+      shrink_applied = FALSE,
+      problema = "row_muni_missing"
+    )
     mx_nmx_final_list[[idx]] <- NULL
     utils::setTxtProgressBar(pb, idx)
     next
   }
   
-  e0_topals <- row_muni$e0_p50
-  e0_ibge   <- row_muni$e0_ibge
-  
-  w_i <- compute_w(e0_topals, e0_ibge, ano_i)
-  
-  # troca de ano: carrega fit 1x
+  # ============================================================
+  # 1) troca de ano: carrega fit 1x e calcula e0_ibge_year
+  # ============================================================
   if (!identical(ano_i, ano_loaded)) {
     ano_loaded <- ano_i
     
-    # limpa o env anterior
     if (!is.null(env_fit)) {
       rm(list = ls(envir = env_fit), envir = env_fit)
       env_fit <- NULL
@@ -1347,93 +1445,147 @@ for (idx in seq_len(nrow(munis_grid))) {
     
     ff_year <- get_fitfile_year(ano_i)
     message("\n[05B] Carregando fit do ano ", ano_i, ": ", basename(ff_year))
+    
     env_fit <- new.env(parent = emptyenv())
     load(ff_year, envir = env_fit)
     
     fit_cur     <- env_fit$fit
     regions_cur <- env_fit$case_meta$regions
+    B_cur       <- env_fit$stanDataList$B
+    std_cur     <- env_fit$stanDataList$std_schedule
     
-    # IMPORTANTÍSSIMO: pega B e std_schedule do stanDataList do próprio fit do ano
-    B_cur   <- env_fit$stanDataList$B
-    std_cur <- env_fit$stanDataList$std_schedule
+    if (length(std_cur) != A_LOOP) {
+      stop("std_schedule com length=", length(std_cur),
+           " mas esperado ", A_LOOP, " (idades 0:100).")
+    }
+    
+    # e0 IBGE do ano na MESMA função que o shrink usa
+    mx_ibge_tbl <- tibble::tibble(idade = AGES_LOOP, mx_ibge = exp(std_cur))
+    e0_ibge_year <- calc_e0_from_mx_tbl(mx_ibge_tbl, mx_col = "mx_ibge")
   }
   
+  # ============================================================
+  # 2) reconstrói mx_topals do município no fit do ano
+  # ============================================================
   mx_tbl <- tryCatch(
     mx_tbl_from_fit_current(
-      fit         = fit_cur,
-      regions     = regions_cur,
-      code_muni6  = code_muni_i,
-      ages        = 0:100,
-      B           = B_cur,
-      std_schedule= std_cur
+      fit          = fit_cur,
+      regions      = regions_cur,
+      code_muni6   = code_muni_i,
+      ages         = AGES_LOOP,
+      B            = B_cur,
+      std_schedule = std_cur
     ),
     error = function(e) NULL
   )
   
   if (is.null(mx_tbl)) {
-    shrink_rows[[idx]] <- tibble(ano = ano_i, code_muni6 = code_muni_i,
-                                 e0_p50_post = e0_topals, w = w_i, k_factor = 1,
-                                 shrink_applied = FALSE)
+    shrink_rows[[idx]] <- tibble::tibble(
+      ano = ano_i, code_muni6 = code_muni_i,
+      e0_p50_post  = NA_real_,
+      e0_topals_lt = NA_real_,
+      e0_ibge_lt   = e0_ibge_year,
+      e0_target_lt = NA_real_,
+      w = 0, k_factor = 1,
+      shrink_applied = FALSE,
+      problema = "mx_tbl_null"
+    )
     mx_nmx_final_list[[idx]] <- NULL
     utils::setTxtProgressBar(pb, idx)
     next
   }
   
-  mx_col <- tryCatch(get_mx_col_name(mx_tbl), error = function(e) NA_character_)
-  if (is.na(mx_col)) {
-    shrink_rows[[idx]] <- tibble(ano = ano_i, code_muni6 = code_muni_i,
-                                 e0_p50_post = e0_topals, w = w_i, k_factor = 1,
-                                 shrink_applied = FALSE)
+  # aqui, por construção, mx_tbl tem "mx_topals"
+  if (!("mx_topals" %in% names(mx_tbl))) {
+    shrink_rows[[idx]] <- tibble::tibble(
+      ano = ano_i, code_muni6 = code_muni_i,
+      e0_p50_post  = NA_real_,
+      e0_topals_lt = NA_real_,
+      e0_ibge_lt   = e0_ibge_year,
+      e0_target_lt = NA_real_,
+      w = 0, k_factor = 1,
+      shrink_applied = FALSE,
+      problema = "mx_topals_missing"
+    )
     mx_nmx_final_list[[idx]] <- NULL
     utils::setTxtProgressBar(pb, idx)
     next
   }
   
-  e0_target <- e0_topals
-  shrink_ok <- FALSE
+  # ============================================================
+  # 3) e0_topals e e0_ibge NA MESMA RÉGUA
+  # ============================================================
+  e0_topals <- calc_e0_from_mx_tbl(mx_tbl, mx_col = "mx_topals")
+  e0_ibge   <- e0_ibge_year
+  
+  # w local
+  w_i <- compute_w_local(e0_topals, e0_ibge, ano_i)
+  
+  # ============================================================
+  # 4) resolve k_factor com bracketing seguro (uniroot)
+  # ============================================================
   k_factor  <- 1
   e0_post   <- e0_topals
+  shrink_ok <- FALSE
+  problema  <- "w_zero_or_nonfinite"
+  e0_target <- NA_real_
   
-  if (!is.na(w_i) && w_i > 0 && is.finite(e0_ibge) && is.finite(e0_topals)) {
-    e0_target_tmp <- e0_topals - w_i * (e0_topals - e0_ibge)
-    if (is.finite(e0_target_tmp) && e0_target_tmp < e0_topals) {
-      e0_target <- e0_target_tmp
+  if (is.finite(w_i) && w_i > 0 && is.finite(e0_topals) && is.finite(e0_ibge)) {
+    
+    e0_target <- e0_topals - w_i * (e0_topals - e0_ibge)
+    
+    if (is.finite(e0_target) && e0_target < e0_topals) {
       
-      f <- function(logk) calc_e0_scaled(logk, mx_tbl, mx_col) - e0_target
+      f <- function(logk) {
+        mx_tmp <- mx_tbl
+        mx_tmp$mx_scaled <- mx_tmp$mx_topals * exp(logk)
+        calc_e0_from_mx_tbl(mx_tmp, mx_col = "mx_scaled") - e0_target
+      }
+      
       f0 <- tryCatch(f(0), error = function(e) NA_real_)
       
-      if (is.finite(f0)) {
-        hi <- log(2)
+      if (is.finite(f0) && f0 > 0) {
+        hi <- log(1.5)
         f_hi <- tryCatch(f(hi), error = function(e) NA_real_)
-        iter <- 0
-        while (is.finite(f_hi) && f_hi > 0 && iter < 10) {
-          hi <- hi + log(2)
+        iter <- 0L
+        
+        while (is.finite(f_hi) && f_hi > 0 && iter < 30L) {
+          hi <- hi + log(1.5)
           f_hi <- tryCatch(f(hi), error = function(e) NA_real_)
-          iter <- iter + 1
+          iter <- iter + 1L
         }
         
-        if (!is.finite(f_hi) || f_hi > 0) {
-          k_factor <- exp(hi)
-          mx_tbl2 <- mx_tbl; mx_tbl2$mx_post <- mx_tbl2[[mx_col]] * k_factor
-          e0_post <- calc_e0_from_mx_tbl(mx_tbl2, mx_col = "mx_post")
-          shrink_ok <- TRUE
-        } else {
+        if (is.finite(f_hi) && f_hi <= 0) {
           root <- tryCatch(uniroot(f, lower = 0, upper = hi), error = function(e) NULL)
-          if (is.null(root)) {
-            k_factor <- exp(hi)
-          } else {
+          if (!is.null(root) && is.finite(root$root)) {
             k_factor <- exp(root$root)
+            
+            mx_tbl2 <- mx_tbl
+            mx_tbl2$mx_post <- mx_tbl2$mx_topals * k_factor
+            e0_post <- calc_e0_from_mx_tbl(mx_tbl2, mx_col = "mx_post")
+            
+            shrink_ok <- TRUE
+            problema <- NA_character_
+          } else {
+            problema <- "uniroot_failed"
           }
-          mx_tbl2 <- mx_tbl; mx_tbl2$mx_post <- mx_tbl2[[mx_col]] * k_factor
-          e0_post <- calc_e0_from_mx_tbl(mx_tbl2, mx_col = "mx_post")
-          shrink_ok <- TRUE
+        } else {
+          problema <- "no_bracket"
         }
+      } else {
+        problema <- "f0_not_positive"
       }
+      
+    } else {
+      problema <- "target_not_lower"
     }
   }
   
+  # ============================================================
+  # 5) monta tabela final + registra diagnóstico
+  # ============================================================
   mx_tbl_final <- mx_tbl %>%
-    dplyr::mutate(mx_nmx_final = .data[[mx_col]] * k_factor) %>%
+    dplyr::mutate(mx_nmx_final = mx_topals * k_factor) %>%
     dplyr::mutate(
       uf                = row_muni$uf[1],
       uf_sigla          = row_muni$uf_sigla[1],
@@ -1448,13 +1600,29 @@ for (idx in seq_len(nrow(munis_grid))) {
       sexo              = SEXO_ALVO
     )
   
-  shrink_rows[[idx]] <- tibble(ano = ano_i, code_muni6 = code_muni_i,
-                               e0_p50_post = e0_post, w = w_i, k_factor = k_factor,
-                               shrink_applied = shrink_ok)
+  shrink_rows[[idx]] <- tibble::tibble(
+    ano = ano_i, code_muni6 = code_muni_i,
+    e0_p50_post  = e0_post,
+    e0_topals_lt = e0_topals,
+    e0_ibge_lt   = e0_ibge,
+    e0_target_lt = e0_target,
+    w = w_i,
+    k_factor = k_factor,
+    shrink_applied = shrink_ok,
+    problema = problema
+  )
+  
   mx_nmx_final_list[[idx]] <- mx_tbl_final
   
   utils::setTxtProgressBar(pb, idx)
 }
+
+mx_tbl_final <- mx_tbl %>%
+  dplyr::mutate(
+    mx_nmx_final = mx_topals * k_factor,
+    # Garante que mx não ultrapasse valor que leva a qx > 1 (para idade 0, mx máximo ~0.6)
+    mx_nmx_final = pmin(mx_nmx_final, 0.95)  # ajuste empírico
+  )
 
 message("Shrink concluído. Montando base consolidada de NMX final...")
 
@@ -1533,10 +1701,26 @@ tab_e60_ibge <- tibble(
   e60_ibge = purrr::map_dbl(anos_alvo, ~ e60_ibge_from_tabua(.x, UF_ALVO, SEXO_ALVO))
 )
 
+# distribuição do k_factor (se isso ainda explodir, o problema é delta/w, não mais "métrica inconsistente")
+shrink_res %>% summarise(
+  n = n(),
+  share_shrunk = mean(shrink_applied, na.rm=TRUE),
+  k_p50 = median(k_factor, na.rm=TRUE),
+  k_p95 = quantile(k_factor, .95, na.rm=TRUE),
+  k_p99 = quantile(k_factor, .99, na.rm=TRUE),
+  k_max = max(k_factor, na.rm=TRUE),
+  n_no_bracket = sum(problema == "no_bracket", na.rm=TRUE),
+  n_uniroot_failed = sum(problema == "uniroot_failed", na.rm=TRUE)
+)
+
+# sanity: e0 pós-shrink sempre <= e0_topals (quando shrink aplicado)
+shrink_res %>% filter(shrink_applied) %>%
+  summarise(viol = sum(e0_p50_post > e0_topals_lt, na.rm=TRUE))
+
 ###############################################################################
 # 8.2) SELEÇÃO DE MUNICÍPIOS FOCO (se não houver objeto munis_foco)
 ###############################################################################
-
+rm(list = c("munis_foco"), envir = .GlobalEnv)
 # Base para escolher porte populacional:
 # - preferir sexo == "b" (total) se existir
 # - senão, somar m+f
@@ -1558,67 +1742,58 @@ pop_col_focus <- {
 if (is.na(pop_col_focus)) stop("Não encontrei coluna de população em base_focus (para munis_foco).")
 
 if (!exists("munis_foco")) {
-  message("Objeto 'munis_foco' não encontrado. Selecionando 4 municípios de porte distinto...")
+  message("Objeto 'munis_foco' não encontrado. Selecionando municípios de foco...")
   
   pop_info <- base_focus %>%
     dplyr::filter(uf_sigla == UF_ALVO) %>%
-    dplyr::group_by(
-      ano, code_muni6, nome_muni,
-      rgi_imediata_code, rgi_imediata_nome
-    ) %>%
-    dplyr::summarise(
-      pop_total = sum(.data[[pop_col_focus]], na.rm = TRUE),
-      .groups   = "drop"
-    ) %>%
-    dplyr::group_by(
-      code_muni6, nome_muni,
-      rgi_imediata_code, rgi_imediata_nome
-    ) %>%
-    dplyr::summarise(
-      pop_medio = mean(pop_total, na.rm = TRUE),
-      .groups   = "drop"
-    ) %>%
-    dplyr::filter(!is.na(pop_medio)) %>%
-    dplyr::mutate(
-      porte_quartil = dplyr::ntile(pop_medio, 4)
-    )
+    dplyr::group_by(ano, code_muni6, nome_muni, rgi_imediata_code, rgi_imediata_nome) %>%
+    dplyr::summarise(pop_total = sum(.data[[pop_col_focus]], na.rm = TRUE), .groups = "drop") %>%
+    dplyr::group_by(code_muni6, nome_muni, rgi_imediata_code, rgi_imediata_nome) %>%
+    dplyr::summarise(pop_medio = mean(pop_total, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::filter(!is.na(pop_medio))
   
-  if (nrow(pop_info) < 4) {
-    stop("Não foi possível selecionar 4 municípios de foco (poucos municípios com população válida).")
+  if (nrow(pop_info) == 0) {
+    stop("Não há municípios com população válida em base_focus para UF_ALVO=", UF_ALVO)
   }
   
-  munis_sel <- tibble::tibble()
-  
-  for (q in 1:4) {
-    cand <- pop_info %>% dplyr::filter(porte_quartil == q)
+  n_take <- min(4L, nrow(pop_info))
+  if (n_take < 4L) {
+    message("⚠️ Só existem ", n_take, " município(s) na UF ", UF_ALVO,
+            ". Vou usar todos como munis_foco (sem quartis).")
+    munis_sel <- pop_info %>% dplyr::arrange(dplyr::desc(pop_medio))
+    munis_sel$porte_quartil <- seq_len(nrow(munis_sel))
+  } else {
+    pop_info <- pop_info %>% dplyr::mutate(porte_quartil = dplyr::ntile(pop_medio, 4))
     
-    # tenta pegar RGIs diferentes
-    if (nrow(munis_sel) > 0) {
-      cand2 <- cand %>% dplyr::filter(!rgi_imediata_code %in% munis_sel$rgi_imediata_code)
-      if (nrow(cand2) > 0) cand <- cand2
+    munis_sel <- tibble::tibble()
+    for (q in 1:4) {
+      cand <- pop_info %>% dplyr::filter(porte_quartil == q)
+      
+      if (nrow(munis_sel) > 0) {
+        cand2 <- cand %>% dplyr::filter(!rgi_imediata_code %in% munis_sel$rgi_imediata_code)
+        if (nrow(cand2) > 0) cand <- cand2
+      }
+      
+      muni_q <- cand %>% dplyr::slice_sample(n = 1)
+      munis_sel <- dplyr::bind_rows(munis_sel, muni_q)
     }
-    
-    muni_q <- cand %>% dplyr::slice_sample(n = 1)
-    munis_sel <- dplyr::bind_rows(munis_sel, muni_q)
   }
   
   munis_foco <- munis_sel %>%
     dplyr::transmute(
-      code_muni6     = code_muni6,
-      nome_muni      = nome_muni,
-      nome_curto     = nome_muni,
-      porte_quartil  = porte_quartil
+      code_muni6    = code_muni6,
+      nome_muni     = nome_muni,
+      nome_curto    = nome_muni,
+      porte_quartil = porte_quartil
     )
   
-  message("Municípios de foco selecionados automaticamente:")
+  message("Municípios de foco:")
   print(munis_foco)
   
 } else {
   message("Usando 'munis_foco' definido externamente (ajustando para ter coluna 'nome_curto'):")
   
-  if (!"code_muni6" %in% names(munis_foco)) {
-    stop("O objeto 'munis_foco' precisa ter uma coluna 'code_muni6'.")
-  }
+  if (!"code_muni6" %in% names(munis_foco)) stop("O objeto 'munis_foco' precisa ter coluna 'code_muni6'.")
   
   if (!"nome_curto" %in% names(munis_foco)) {
     if ("nome_muni" %in% names(munis_foco)) {
@@ -1984,7 +2159,7 @@ for (ano_k in anos_mapa) {
   
   out_e0 <- map_ano_e0 |>
     dplyr::filter(flag_e0_low | flag_e0_high)
-  
+                                    ''    
   p_mapa_e0 <- ggplot2::ggplot() +
     ggplot2::geom_sf(data = map_ano_e0, ggplot2::aes(fill = e0_p50_post), color = NA) +
     viridis::scale_fill_viridis(
@@ -2084,10 +2259,10 @@ for (ano_k in anos_mapa) {
 ###############################################################################
 
 # marque como OK só aqui no final mesmo
-PIPELINE_OK <- TRUE
+PIPELINE_OK <- F
 
 # configura limpeza
-DELETE_FITS <- FALSE  # <--- mude pra TRUE se quiser apagar de verdade (irreversível)
+DELETE_FITS <- F  # <--- mude pra TRUE se quiser apagar de verdade (irreversível)
 MOVE_DIR_FITS <- file.path(TOPALS_FIT_DIR, "_trash_fits_ok")
 
 cleanup_fits_if_success <- function() {
